@@ -1,0 +1,195 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.3.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    ports:
+      - "2181:2181"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]  # Check if port 2181 is open
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - kafka-net
+
+  kafka:
+    image: confluentinc/cp-kafka:7.3.0
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9093,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    ports:
+      - "9092:9092"  # External access
+      - "9093:9093"  # Internal access
+    networks:
+      - kafka-net
+
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: financial
+    volumes:
+      - ./data/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - kafka-net
+    healthcheck:  # <-- Add this section
+      test: ["CMD-SHELL", "pg_isready -U airflow -d financial"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+  
+  airflow-init:
+    image: apache/airflow:2.10.4
+    entrypoint: >
+      /bin/bash -c "
+      until pg_isready -h postgres -p 5432; do echo 'Waiting for PostgreSQL...'; sleep 5; done;
+      airflow db init &&
+      airflow users create -r Admin -u admin -p admin -e admin@example.com -f Admin -l User &&
+      echo 'Airflow initialization completed.'"
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/financial
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - kafka-net
+
+  airflow:
+    build: ./airflow
+    depends_on:
+      - airflow-init
+      - postgres
+      - kafka
+    environment:
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+      AIRFLOW__API__TEST_CONNECTION: Enabled
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/financial  
+      # Monitoring Configuratiom
+      AIRFLOW__METRICS__STATSD_ON: "True"
+      AIRFLOW__METRICS__STATSD_HOST: "statsd-exporter"
+      AIRFLOW__METRICS__STATSD_PORT: "9125"
+      AIRFLOW__METRICS__STATSD_PREFIX: "airflow"
+      # Kafka configuration
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9093"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_TOPIC: "coinbase_trades"
+      # PostgreSQL configuration
+      POSTGRES_HOST: "postgres"
+      POSTGRES_DB: "financial"
+      POSTGRES_USER: "airflow"
+      POSTGRES_PASSWORD: "airflow"
+      POSTGRES_PORT: "5432"
+      # Consumer group
+      KAFKA_CONSUMER_GROUP: "coinbase_consumer_group"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./data:/data
+      - ./kafka:/opt/airflow/kafka 
+    ports:
+      - "8080:8080"
+    command: webserver
+    networks:
+      - kafka-net
+  
+  airflow-scheduler:
+    build: ./airflow
+    depends_on:
+      - airflow-init
+      - postgres
+      - kafka
+    environment:
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+      AIRFLOW__API__TEST_CONNECTION: Enabled
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/financial
+
+      # Monitoring Configuratiom
+      AIRFLOW__METRICS__STATSD_ON: "True"
+      AIRFLOW__METRICS__STATSD_HOST: "statsd-exporter"
+      AIRFLOW__METRICS__STATSD_PORT: "9125"
+      AIRFLOW__METRICS__STATSD_PREFIX: "airflow"
+      
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9093"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./data:/data
+    command: scheduler
+    networks:
+      - kafka-net
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    networks:
+      - kafka-net
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    restart: always
+
+  grafana:
+    image: grafana/grafana:latest
+    depends_on:
+      - prometheus
+    ports:
+      - "3000:3000"
+    networks:
+      - kafka-net
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-storage:/var/lib/grafana
+
+  
+  kafka-exporter:
+    image: bitnami/kafka-exporter:latest
+    environment:
+      KAFKA_BROKER_LIST: kafka:9093
+    ports:
+      - "9308:9308"
+    networks:
+      - kafka-net
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:latest
+    environment:
+      DATA_SOURCE_NAME: postgresql://airflow:airflow@postgres:5432/financial?sslmode=disable
+    ports:
+      - "9187:9187"
+    networks:
+      - kafka-net
+
+  statsd-exporter:
+    image: prom/statsd-exporter:latest
+    ports:
+      - "9102:9102"
+      - "9125:9125/udp"
+    command:
+      - --statsd.mapping-config=/etc/statsd/mapping.yml
+    volumes:
+      - ./monitoring/statsd_mapping.yml:/etc/statsd/mapping.yml
+    networks:
+      - kafka-net
+  
+volumes:
+  grafana-storage:
+
+networks:
+  kafka-net:
+    driver: bridge

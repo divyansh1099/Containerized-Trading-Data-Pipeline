@@ -1,0 +1,8 @@
+apache-airflow
+apache-airflow-providers-apache-kafka
+apache-airflow-providers-postgres
+websocket-client
+confluent-kafka
+psycopg2-binary
+prometheus-client
+python-dotenv
